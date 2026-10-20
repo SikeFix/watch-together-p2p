@@ -45,6 +45,10 @@ function render(s) {
   $('mute').textContent = s.muted ? '取消静音' : '静音';
   $('mute').classList.toggle('muted', !!s.muted);
   $('talkers').textContent = s.talkers && s.talkers.length ? '🔊 正在听到：' + s.talkers.join('、') : '';
+  $('cam').textContent = s.cam ? '📷 关闭摄像头' : '📷 打开摄像头';
+  $('cam').classList.toggle('on', !!s.cam);
+  $('cam').disabled = s.status !== 'connected';
+  $('cam').title = $('voice').title;
   voiceState = s;
   const here = activeTab && s.boundTabId === activeTab.id;
   $('bind').hidden = here;
@@ -64,6 +68,7 @@ $('join').onclick = async () => {
 $('code').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('join').click(); });
 $('voice').onclick = async () => render(await bg('voice', { on: !voiceState.voice }));
 $('mute').onclick = async () => { await bg('mute', { muted: !voiceState.muted }); render(await bg('getState')); };
+$('cam').onclick = async () => render(await bg('cam', { on: !voiceState.cam }));
 $('leave').onclick = async () => render(await bg('leave'));
 $('bind').onclick = async () => render(await bg('bind', { tabId: activeTab.id }));
 $('copy').onclick = async () => {

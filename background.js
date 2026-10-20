@@ -16,6 +16,8 @@ const DEFAULT_STATE = {
   voice: false,        // 我是否开启了语音
   muted: false,
   talkers: [],         // 正在听到声音的成员
+  cam: false,          // 我是否开着摄像头
+  cams: [],            // 开着摄像头的其他成员 [{ id, name }]
 };
 
 // ---------- 状态（storage.session，SW 休眠重启后仍在） ----------
@@ -175,6 +177,8 @@ const handlers = {
       voice: !!m.voice,
       muted: !!m.muted,
       talkers: m.talkers || [],
+      cam: !!m.cam,
+      cams: m.cams || [],
     }));
     await broadcastState();
   },
@@ -191,12 +195,20 @@ const handlers = {
     await toOffscreen({ cmd: 'mute', muted: !!muted });
   },
 
-  // offscreen 页面不能弹出麦克风授权框，打开一个扩展页面让用户授权一次
-  async voiceError({ name }) {
+  async cam({ on }) {
+    const s = await getState();
+    if (s.room == null) return publicState(s);
+    await toOffscreen({ cmd: on ? 'camOn' : 'camOff' });
+    return publicState(s);
+  },
+
+  // offscreen 页面不能弹出授权框，打开一个扩展页面让用户授权一次
+  async mediaError({ kind, name }) {
+    const label = kind === 'cam' ? '摄像头' : '麦克风';
     if (name === 'NotAllowedError' || name === 'SecurityError') {
-      await chrome.tabs.create({ url: chrome.runtime.getURL('permission.html') });
+      await chrome.tabs.create({ url: chrome.runtime.getURL('permission.html?kind=' + kind) });
     } else {
-      await handlers.system({ text: name === 'NotFoundError' ? '没有找到麦克风' : '无法打开麦克风：' + name });
+      await handlers.system({ text: name === 'NotFoundError' ? `没有找到${label}` : `无法打开${label}：${name}` });
     }
   },
 

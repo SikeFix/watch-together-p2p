@@ -120,9 +120,72 @@
     applyingUntil = Date.now() + 500;
   }
 
+  // ---------------- 视频通话（只接收；摄像头在 offscreen 里采集） ----------------
+  const ICE = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
+    ],
+  };
+  const viewerId = Math.random().toString(36).slice(2, 10); // 每次页面加载一个，区分过期的 offer
+  const camViews = new Map(); // 对方 peerId -> { name, pc, stream, connected, wantAt }
+  let lastCamSync = 0;
+
+  function syncCams() {
+    lastCamSync = Date.now();
+    const want = new Map((bound ? state.cams || [] : []).map((c) => [c.id, c]));
+    for (const id of [...camViews.keys()]) if (!want.has(id)) closeCamView(id);
+    for (const [id, c] of want) {
+      const v = camViews.get(id);
+      if (!v || (!v.connected && Date.now() - v.wantAt > 8000)) requestCam(id, c.name);
+    }
+    ui && ui.renderCams(camViews);
+  }
+  function requestCam(id, name) {
+    closeCamView(id);
+    camViews.set(id, { name, pc: null, stream: null, connected: false, wantAt: Date.now() });
+    send({ t: 'cam-want', to: id, vid: viewerId });
+  }
+  function closeCamView(id) {
+    const v = camViews.get(id);
+    if (!v) return;
+    camViews.delete(id);
+    try { v.pc && v.pc.close(); } catch (_) {}
+  }
+  function iceGathered(pc) {
+    return new Promise((resolve) => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      const t = setTimeout(resolve, 3000);
+      pc.addEventListener('icegatheringstatechange', () => {
+        if (pc.iceGatheringState === 'complete') { clearTimeout(t); resolve(); }
+      });
+    });
+  }
+  async function onCamOffer(m) {
+    const v = camViews.get(m.fromId);
+    if (m.vid !== viewerId || !v) return;
+    try { v.pc && v.pc.close(); } catch (_) {}
+    const pc = new RTCPeerConnection(ICE);
+    v.pc = pc;
+    pc.ontrack = (ev) => {
+      v.stream = ev.streams[0] || new MediaStream([ev.track]);
+      v.connected = true;
+      ui && ui.renderCams(camViews);
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' && v.pc === pc) { v.connected = false; v.wantAt = 0; } // 下次 syncCams 重新请求
+    };
+    await pc.setRemoteDescription({ type: 'offer', sdp: m.sdp });
+    await pc.setLocalDescription(await pc.createAnswer());
+    await iceGathered(pc);
+    if (v.pc !== pc) return;
+    send({ t: 'cam-answer', to: m.fromId, vid: viewerId, sdp: pc.localDescription.sdp });
+  }
+
   // ---------------- 主循环 ----------------
   function loop() {
     if (!bound) return;
+    if (Date.now() - lastCamSync > 2000) syncCams();
     const v = findVideo();
     if (v !== video) attach(v);
     const k = currentKey();
@@ -152,6 +215,9 @@
       case 'system':
         ui && ui.line({ system: true, text: msg.text });
         break;
+      case 'cam-offer':
+        onCamOffer(msg);
+        break;
     }
   }
 
@@ -170,19 +236,21 @@
       tickTimer = setInterval(tick, 3000);
     }
     ui.render(state);
+    syncCams();
   }
   function deactivate() {
     bound = false;
     clearInterval(loopTimer);
     clearInterval(tickTimer);
     attach(null);
+    syncCams();
     ui && ui.hide();
   }
 
   chrome.runtime.onMessage.addListener((m) => {
     if (m.evt === 'bind') activate();
     else if (m.evt === 'unbind') deactivate();
-    else if (m.evt === 'state') { state = m.state; ui && ui.render(state); }
+    else if (m.evt === 'state') { state = m.state; ui && ui.render(state); syncCams(); }
     else if (m.evt === 'peer' && bound) onPeer(m.msg);
   });
 
@@ -225,15 +293,28 @@ form{display:flex;gap:6px;padding:8px 10px 10px}
 input[type=text]{flex:1;min-width:0;background:rgba(255,255,255,.08);border:1px solid transparent;border-radius:8px;color:var(--fg);padding:7px 10px;outline:none;font-size:13px}
 input[type=text]:focus{border-color:var(--acc)}
 form button{all:unset;cursor:pointer;background:var(--acc);color:#fff;border-radius:8px;padding:0 12px;font-weight:600}
+.cams{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;pointer-events:auto;cursor:move;touch-action:none}
+.cams:empty{display:none}
+.tile{position:relative;width:200px;aspect-ratio:4/3;border-radius:12px;overflow:hidden;background:#111;box-shadow:0 8px 28px rgba(0,0,0,.45);border:1px solid var(--line)}
+.cams.big .tile{width:320px}
+.tile video{width:100%;height:100%;object-fit:cover;display:block;background:#111}
+.tile .nm{position:absolute;left:8px;bottom:6px;color:#fff;font-size:12px;text-shadow:0 0 3px #000}
+.tile .wait{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);font-size:12px}
+.tile .bt{position:absolute;top:6px;right:6px;display:flex;gap:4px;opacity:0;transition:opacity .15s}
+.tile:hover .bt{opacity:1}
+.tile .bt button{all:unset;cursor:pointer;background:rgba(0,0,0,.55);color:#fff;border-radius:6px;padding:2px 6px;font-size:12px}
+.tools button.cam.on{background:#3ddc84;color:#111}
 .dm{position:fixed;white-space:nowrap;font-size:22px;font-weight:700;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000;pointer-events:none;will-change:transform;animation:fly linear forwards}
 @keyframes fly{from{transform:translateX(0)}to{transform:translateX(var(--dx))}}
 </style>
+<div class="cams"></div>
 <div class="panel">
   <div class="hd"><span class="dot"></span><span class="title">一起看</span><span class="sub"></span><button class="minbtn" title="收起">–</button></div>
   <div class="vc" hidden><span class="who"></span><button class="mute">🎙 静音</button></div>
   <div class="log"></div>
   <div class="tools">
     <button class="voice" title="开启语音通话（P2P 直连，建议戴耳机）">🎙 语音</button>
+    <button class="cam" title="打开摄像头，对方会在小窗里看到你">📷 视频</button>
     <button class="pull" title="把我当前的进度/播放状态推给所有人">⇆ 让大家同步到我</button>
     <label><input type="checkbox" class="follow">跟随切换视频</label>
     <label><input type="checkbox" class="danmaku">弹幕</label>
@@ -273,6 +354,39 @@ form button{all:unset;cursor:pointer;background:var(--acc);color:#fff;border-rad
       send(snapshot('pull'));
       api.line({ system: true, text: '已把你的进度推送给大家' });
     });
+    $('.cam').addEventListener('click', () => rt({ cmd: 'cam', on: !state.cam }));
+
+    // 摄像头小窗：拖动、放大、画中画
+    const cams = $('.cams');
+    const tiles = new Map();
+    let camsBig = false;
+    cams.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('button')) return;
+      const r0 = cams.getBoundingClientRect();
+      const ox = e.clientX - r0.left;
+      const oy = e.clientY - r0.top;
+      cams.setPointerCapture(e.pointerId);
+      const move = (ev) => {
+        cams.style.left = Math.max(0, Math.min(innerWidth - r0.width, ev.clientX - ox)) + 'px';
+        cams.style.top = Math.max(0, Math.min(innerHeight - 60, ev.clientY - oy)) + 'px';
+        cams.style.right = 'auto';
+      };
+      const up = () => { cams.removeEventListener('pointermove', move); cams.removeEventListener('pointerup', up); };
+      cams.addEventListener('pointermove', move);
+      cams.addEventListener('pointerup', up);
+    });
+    function makeTile() {
+      const t = document.createElement('div');
+      t.className = 'tile';
+      t.innerHTML = '<video autoplay playsinline muted></video><div class="wait">连接中…</div><span class="nm"></span><div class="bt"><button class="big" title="放大/缩小">⤢</button><button class="pip" title="画中画（切到别的页面也能看到）">⧉</button></div>';
+      t.querySelector('.big').onclick = () => { camsBig = !camsBig; cams.classList.toggle('big', camsBig); };
+      t.querySelector('.pip').onclick = async () => {
+        try { await t.querySelector('video').requestPictureInPicture(); }
+        catch (_) { api.line({ system: true, text: '此网站不允许画中画' }); }
+      };
+      return t;
+    }
+
     $('.voice').addEventListener('click', () => rt({ cmd: 'voice', on: !state.voice }));
     $('.mute').addEventListener('click', () => rt({ cmd: 'mute', muted: !state.muted }));
     $('.follow').addEventListener('change', (e) => rt({ cmd: 'setPref', follow: e.target.checked }));
@@ -310,6 +424,8 @@ form button{all:unset;cursor:pointer;background:var(--acc);color:#fff;border-rad
         $('.sub').title = (s.members || []).join('、');
         $('.follow').checked = !!s.follow;
         $('.danmaku').checked = !!s.danmaku;
+        $('.cam').classList.toggle('on', !!s.cam);
+        $('.cam').textContent = s.cam ? '📷 关摄像头' : '📷 视频';
         const talkers = s.talkers || [];
         $('.voice').classList.toggle('on', !!s.voice);
         $('.voice').textContent = s.voice ? '📴 退出语音' : '🎙 语音';
@@ -331,6 +447,17 @@ form button{all:unset;cursor:pointer;background:var(--acc);color:#fff;border-rad
         log.appendChild(d);
         while (log.children.length > 200) log.firstChild.remove();
         log.scrollTop = log.scrollHeight;
+      },
+      renderCams(views) {
+        for (const [id, t] of tiles) if (!views.has(id)) { t.remove(); tiles.delete(id); }
+        for (const [id, v] of views) {
+          let t = tiles.get(id);
+          if (!t) { t = makeTile(); tiles.set(id, t); cams.appendChild(t); }
+          t.querySelector('.nm').textContent = v.name || '朋友';
+          t.querySelector('.wait').hidden = v.connected;
+          const el = t.querySelector('video');
+          if (v.stream && el.srcObject !== v.stream) { el.srcObject = v.stream; el.play().catch(() => {}); }
+        }
       },
       danmaku(text, self) {
         if (!video) return;

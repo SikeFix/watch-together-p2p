@@ -1,6 +1,8 @@
 // Offscreen 文档：持有 PeerJS / WebRTC 连接。
 // 数据：房主(host)与每位成员直连，房主负责转发（星型拓扑）。
 // 语音：成员之间两两直连（网状），音频不经过任何服务器。
+// 视频：摄像头在这里采集，直接推给每位成员页面里的小窗（内容脚本只接收），
+//       握手(SDP)走已有的数据通道，不需要额外服务器。
 // 仅握手阶段使用 PeerJS 公共信令服务器交换 SDP。
 
 const PREFIX = 'wtp2p-';
@@ -24,6 +26,18 @@ let muted = false;
 let localStream = null;
 const calls = new Map();        // peerId -> { call, outgoing, at, audio, live }
 
+// 视频
+const ICE = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'], username: 'peerjs', credential: 'peerjsp' },
+  ],
+};
+let camOn = false;
+let camStream = null;
+let camIds = new Set();         // 开着摄像头的成员（房主维护，随 members 下发）
+const camPcs = new Map();       // 观看者 peerId -> RTCPeerConnection
+
 const emit = (evt, data = {}) => chrome.runtime.sendMessage({ to: 'bg', evt, ...data }).catch(() => {});
 const system = (text) => emit('system', { text });
 
@@ -44,6 +58,8 @@ function status(s, extra = {}) {
     voice: voiceOn,
     muted,
     talkers: [...calls].filter(([, c]) => c.live).map(([id]) => nameOf(id)),
+    cam: camOn,
+    cams: roster().filter((p) => p.id && camIds.has(p.id) && (!peer || p.id !== peer.id)),
     ...extra,
   });
 }
@@ -70,6 +86,8 @@ function destroy() {
   leaving = true;
   clearTimeout(retryTimer);
   stopVoice(false);
+  stopCam(false);
+  camIds = new Set();
   try { peer && peer.destroy(); } catch (_) {}
   peer = null;
   hostConn = null;
@@ -87,9 +105,20 @@ function reconnectSignalingLater() {
 
 // 收到房间内的数据消息（host / guest 共用）
 function onData(d) {
-  if (d.t === 'voice') {
-    system(`${d.from || '朋友'} ${d.on ? '开启' : '退出'}了语音`);
-    return;
+  if (d.to && peer && d.to !== peer.id) return; // 发给别人的（房主星型转发）
+  switch (d.t) {
+    case 'voice':
+      system(`${d.from || '朋友'} ${d.on ? '开启' : '关闭'}了语音`);
+      return;
+    case 'cam':
+      system(`${d.from || '朋友'} ${d.on ? '打开' : '关闭'}了摄像头`);
+      if (role === 'host') {
+        if (d.on) camIds.add(d.fromId); else camIds.delete(d.fromId);
+        syncMembers();
+      }
+      return;
+    case 'cam-want': offerCam(d.fromId, d.vid); return;
+    case 'cam-answer': answerCam(d); return;
   }
   emit('peer', { msg: d });
 }
@@ -118,6 +147,7 @@ function createRoom(name, attempt = 0) {
       if (!d || typeof d !== 'object') return;
       const c = conns.get(conn.peer);
       d.from = c ? c.name : d.from;
+      d.fromId = conn.peer;
       // 转发给其他成员
       for (const [id, other] of conns) if (id !== conn.peer && other.conn.open) other.conn.send(d);
       onData(d);
@@ -127,6 +157,8 @@ function createRoom(name, attempt = 0) {
       if (!c) return;
       conns.delete(conn.peer);
       closeCall(conn.peer);
+      closeCamPc(conn.peer);
+      camIds.delete(conn.peer);
       system(`${c.name} 离开了房间`);
       syncMembers();
     });
@@ -148,7 +180,8 @@ function createRoom(name, attempt = 0) {
 
 function syncMembers() {
   const peers = roster();
-  for (const { conn } of conns.values()) if (conn.open) conn.send({ t: 'members', peers });
+  const cams = [...camIds];
+  for (const { conn } of conns.values()) if (conn.open) conn.send({ t: 'members', peers, cams });
   status(conns.size ? 'connected' : 'waiting');
 }
 
@@ -195,7 +228,9 @@ function connectHost() {
     if (d.t === 'members') {
       const ids = new Set(d.peers.map((p) => p.id));
       for (const id of [...calls.keys()]) if (!ids.has(id)) closeCall(id);
+      for (const id of [...camPcs.keys()]) if (!ids.has(id)) closeCamPc(id);
       peerList = d.peers;
+      camIds = new Set(d.cams || []);
       if (voiceOn) for (const id of otherIds()) if (!calls.has(id)) callPeer(id);
       status('connected');
       return;
@@ -224,6 +259,7 @@ function rejoinLater() {
 // ---------------- 发送 ----------------
 function send(msg) {
   msg.from = myName;
+  msg.fromId = peer && peer.id;
   if (role === 'host') {
     for (const { conn } of conns.values()) if (conn.open) conn.send(msg);
   } else if (hostConn && hostConn.open) {
@@ -240,7 +276,7 @@ async function startVoice() {
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
   } catch (e) {
-    emit('voiceError', { name: e.name });
+    emit('mediaError', { kind: 'voice', name: e.name });
     return;
   }
   voiceOn = true;
@@ -317,6 +353,82 @@ function closeCall(id) {
   try { e.call.close(); } catch (_) {}
 }
 
+// ---------------- 视频 ----------------
+async function startCam() {
+  if (camOn || !peer) return;
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 20 } },
+      audio: false, // 声音走语音通话
+    });
+  } catch (e) {
+    emit('mediaError', { kind: 'cam', name: e.name });
+    return;
+  }
+  camOn = true;
+  announceCam(true);
+}
+
+function stopCam(announce = true) {
+  if (!camOn) return;
+  camOn = false;
+  if (camStream) camStream.getTracks().forEach((t) => t.stop());
+  camStream = null;
+  for (const id of [...camPcs.keys()]) closeCamPc(id);
+  if (announce) announceCam(false);
+}
+
+function announceCam(on) {
+  if (role === 'host') {
+    if (on) camIds.add(peer.id); else camIds.delete(peer.id);
+    send({ t: 'cam', on });
+    syncMembers();
+  } else {
+    send({ t: 'cam', on }); // 房主更新名单后通过 members 下发
+    refresh();
+  }
+}
+
+// 观看者（对方页面里的小窗）请求画面 → 发 offer
+async function offerCam(toId, vid) {
+  if (!camOn || !camStream || !toId) return;
+  closeCamPc(toId);
+  const pc = new RTCPeerConnection(ICE);
+  camPcs.set(toId, pc);
+  camStream.getTracks().forEach((t) => pc.addTrack(t, camStream));
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'closed'].includes(pc.connectionState) && camPcs.get(toId) === pc) closeCamPc(toId);
+  };
+  await pc.setLocalDescription(await pc.createOffer());
+  await iceGathered(pc);
+  if (camPcs.get(toId) !== pc) return;
+  send({ t: 'cam-offer', to: toId, vid, sdp: pc.localDescription.sdp });
+}
+
+async function answerCam(d) {
+  const pc = camPcs.get(d.fromId);
+  if (!pc || pc.signalingState !== 'have-local-offer') return;
+  try { await pc.setRemoteDescription({ type: 'answer', sdp: d.sdp }); } catch (_) {}
+}
+
+function closeCamPc(id) {
+  const pc = camPcs.get(id);
+  if (!pc) return;
+  camPcs.delete(id);
+  try { pc.close(); } catch (_) {}
+}
+
+// 不做 trickle ICE：等候选收集完一次性发出，握手只需一来一回
+function iceGathered(pc) {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    const t = setTimeout(resolve, 3000);
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') { clearTimeout(t); resolve(); }
+    });
+  });
+}
+
 chrome.runtime.onMessage.addListener((m, _sender, sendResponse) => {
   if (!m || m.to !== 'offscreen') return false;
   switch (m.cmd) {
@@ -326,6 +438,8 @@ chrome.runtime.onMessage.addListener((m, _sender, sendResponse) => {
     case 'voiceOn': startVoice(); break;
     case 'voiceOff': stopVoice(); break;
     case 'mute': setMuted(m.muted); break;
+    case 'camOn': startCam(); break;
+    case 'camOff': stopCam(); break;
     case 'leave': destroy(); role = null; room = null; break;
   }
   sendResponse({ ok: true });
