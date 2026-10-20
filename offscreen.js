@@ -1,5 +1,6 @@
 // Offscreen 文档：持有 PeerJS / WebRTC 连接。
-// 房主(host)与每位成员直连，房主负责转发（星型拓扑），数据不经过任何自建服务器。
+// 数据：房主(host)与每位成员直连，房主负责转发（星型拓扑）。
+// 语音：成员之间两两直连（网状），音频不经过任何服务器。
 // 仅握手阶段使用 PeerJS 公共信令服务器交换 SDP。
 
 const PREFIX = 'wtp2p-';
@@ -11,21 +12,43 @@ let room = null;
 let myName = '';
 let hostConn = null;            // guest -> host
 const conns = new Map();        // host: peerId -> { conn, name }
-let guestMembers = [];
+let peerList = [];              // guest: 房主下发的 [{ id, name }]
 let everConnected = false;
 let leaving = false;
 let retryTimer = null;
+let curStatus = 'idle';
+
+// 语音
+let voiceOn = false;
+let muted = false;
+let localStream = null;
+const calls = new Map();        // peerId -> { call, outgoing, at, audio, live }
 
 const emit = (evt, data = {}) => chrome.runtime.sendMessage({ to: 'bg', evt, ...data }).catch(() => {});
 const system = (text) => emit('system', { text });
 
-function members() {
-  if (role === 'host') return [myName, ...[...conns.values()].map((c) => c.name)];
-  return guestMembers;
+function roster() {
+  if (role === 'host') return [{ id: peer && peer.id, name: myName }, ...[...conns].map(([id, c]) => ({ id, name: c.name }))];
+  return peerList;
 }
+const members = () => roster().map((p) => p.name);
+const nameOf = (id) => (roster().find((p) => p.id === id) || {}).name || '朋友';
+const otherIds = () => roster().map((p) => p.id).filter((id) => id && peer && id !== peer.id);
+
 function status(s, extra = {}) {
-  emit('status', { status: s, room, members: members(), ...extra });
+  curStatus = s;
+  emit('status', {
+    status: s,
+    room,
+    members: members(),
+    voice: voiceOn,
+    muted,
+    talkers: [...calls].filter(([, c]) => c.live).map(([id]) => nameOf(id)),
+    ...extra,
+  });
 }
+const refresh = () => status(curStatus);
+
 function genCode() {
   const a = crypto.getRandomValues(new Uint8Array(6));
   return [...a].map((x) => ALPHABET[x % ALPHABET.length]).join('');
@@ -46,11 +69,12 @@ function errText(err) {
 function destroy() {
   leaving = true;
   clearTimeout(retryTimer);
+  stopVoice(false);
   try { peer && peer.destroy(); } catch (_) {}
   peer = null;
   hostConn = null;
   conns.clear();
-  guestMembers = [];
+  peerList = [];
   everConnected = false;
 }
 
@@ -59,6 +83,15 @@ function reconnectSignalingLater() {
   retryTimer = setTimeout(() => {
     if (!leaving && peer && peer.disconnected && !peer.destroyed) peer.reconnect();
   }, 3000);
+}
+
+// 收到房间内的数据消息（host / guest 共用）
+function onData(d) {
+  if (d.t === 'voice') {
+    system(`${d.from || '朋友'} ${d.on ? '开启' : '退出'}了语音`);
+    return;
+  }
+  emit('peer', { msg: d });
 }
 
 // ---------------- 房主 ----------------
@@ -72,12 +105,14 @@ function createRoom(name, attempt = 0) {
 
   peer = new Peer(PREFIX + room, { debug: 1 });
   peer.on('open', () => status('waiting'));
+  peer.on('call', onIncomingCall);
   peer.on('connection', (conn) => {
     conn.on('open', () => {
       const n = String(conn.metadata?.name || '朋友').slice(0, 20);
       conns.set(conn.peer, { conn, name: n });
       system(`${n} 加入了房间`);
       syncMembers();
+      if (voiceOn) callPeer(conn.peer);
     });
     conn.on('data', (d) => {
       if (!d || typeof d !== 'object') return;
@@ -85,12 +120,13 @@ function createRoom(name, attempt = 0) {
       d.from = c ? c.name : d.from;
       // 转发给其他成员
       for (const [id, other] of conns) if (id !== conn.peer && other.conn.open) other.conn.send(d);
-      emit('peer', { msg: d });
+      onData(d);
     });
     conn.on('close', () => {
       const c = conns.get(conn.peer);
       if (!c) return;
       conns.delete(conn.peer);
+      closeCall(conn.peer);
       system(`${c.name} 离开了房间`);
       syncMembers();
     });
@@ -105,13 +141,14 @@ function createRoom(name, attempt = 0) {
       if (!conns.size) status('reconnecting', { error: errText(err) });
       return;
     }
+    if (err.type === 'peer-unavailable') return; // 语音呼叫的对象已离开
     status('error', { error: errText(err) });
   });
 }
 
 function syncMembers() {
-  const list = members();
-  for (const { conn } of conns.values()) if (conn.open) conn.send({ t: 'members', list });
+  const peers = roster();
+  for (const { conn } of conns.values()) if (conn.open) conn.send({ t: 'members', peers });
   status(conns.size ? 'connected' : 'waiting');
 }
 
@@ -126,9 +163,11 @@ function joinRoom(code, name) {
 
   peer = new Peer({ debug: 1 });
   peer.on('open', connectHost);
+  peer.on('call', onIncomingCall);
   peer.on('disconnected', () => { if (!leaving) reconnectSignalingLater(); });
   peer.on('error', (err) => {
     if (err.type === 'peer-unavailable') {
+      if (hostConn && hostConn.open) return; // 语音呼叫的对象已离开
       if (everConnected) { status('reconnecting'); rejoinLater(); }
       else status('error', { error: errText(err) });
       return;
@@ -153,8 +192,15 @@ function connectHost() {
   });
   c.on('data', (d) => {
     if (!d || typeof d !== 'object') return;
-    if (d.t === 'members') { guestMembers = d.list; status('connected'); return; }
-    emit('peer', { msg: d });
+    if (d.t === 'members') {
+      const ids = new Set(d.peers.map((p) => p.id));
+      for (const id of [...calls.keys()]) if (!ids.has(id)) closeCall(id);
+      peerList = d.peers;
+      if (voiceOn) for (const id of otherIds()) if (!calls.has(id)) callPeer(id);
+      status('connected');
+      return;
+    }
+    onData(d);
   });
   c.on('close', () => {
     if (leaving || hostConn !== c) return;
@@ -185,12 +231,101 @@ function send(msg) {
   }
 }
 
+// ---------------- 语音 ----------------
+// 没开麦的人也会自动接听（只听不说），所以一方开麦另一方就能听到。
+async function startVoice() {
+  if (voiceOn || !peer) return;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) {
+    emit('voiceError', { name: e.name });
+    return;
+  }
+  voiceOn = true;
+  muted = false;
+  // 之前“只听”的通话没有我的音轨，挂断后带着麦克风重新呼叫
+  for (const id of [...calls.keys()]) closeCall(id);
+  for (const id of otherIds()) callPeer(id);
+  send({ t: 'voice', on: true });
+  refresh();
+}
+
+function stopVoice(announce = true) {
+  if (!voiceOn && !calls.size) return;
+  const was = voiceOn;
+  voiceOn = false;
+  muted = false;
+  if (localStream) localStream.getTracks().forEach((t) => t.stop());
+  localStream = null;
+  for (const id of [...calls.keys()]) closeCall(id);
+  if (announce && was) send({ t: 'voice', on: false });
+  if (announce) refresh();
+}
+
+function setMuted(m) {
+  muted = !!m;
+  if (localStream) localStream.getAudioTracks().forEach((t) => { t.enabled = !muted; });
+  refresh();
+}
+
+function callPeer(id) {
+  if (!peer || !localStream) return;
+  setupCall(peer.call(id, localStream), true);
+}
+
+function onIncomingCall(call) {
+  const old = calls.get(call.peer);
+  // 双方同时呼叫：保留 ID 较小一方发起的那通
+  if (old && old.outgoing && Date.now() - old.at < 3000 && peer.id < call.peer) {
+    call.close();
+    return;
+  }
+  if (old) closeCall(call.peer);
+  call.answer(voiceOn ? localStream : undefined);
+  setupCall(call, false);
+}
+
+function setupCall(call, outgoing) {
+  const entry = { call, outgoing, at: Date.now(), audio: null, live: false };
+  calls.set(call.peer, entry);
+  call.on('stream', (stream) => {
+    if (calls.get(call.peer) !== entry) return;
+    if (!entry.audio) {
+      entry.audio = new Audio();
+      entry.audio.autoplay = true;
+    }
+    entry.audio.srcObject = stream;
+    entry.audio.play().catch(() => {});
+    entry.live = stream.getAudioTracks().length > 0;
+    refresh();
+  });
+  call.on('close', () => {
+    if (calls.get(call.peer) !== entry) return;
+    closeCall(call.peer);
+    refresh();
+  });
+  call.on('error', () => {});
+}
+
+function closeCall(id) {
+  const e = calls.get(id);
+  if (!e) return;
+  calls.delete(id);
+  if (e.audio) { e.audio.pause(); e.audio.srcObject = null; }
+  try { e.call.close(); } catch (_) {}
+}
+
 chrome.runtime.onMessage.addListener((m, _sender, sendResponse) => {
   if (!m || m.to !== 'offscreen') return false;
   switch (m.cmd) {
     case 'create': createRoom(m.name); break;
     case 'join': joinRoom(m.code, m.name); break;
     case 'send': send(m.msg); break;
+    case 'voiceOn': startVoice(); break;
+    case 'voiceOff': stopVoice(); break;
+    case 'mute': setMuted(m.muted); break;
     case 'leave': destroy(); role = null; room = null; break;
   }
   sendResponse({ ok: true });

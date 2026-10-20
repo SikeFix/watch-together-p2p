@@ -199,6 +199,12 @@
 .panel{position:fixed;right:16px;bottom:16px;width:300px;height:400px;display:flex;flex-direction:column;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.4);pointer-events:auto;backdrop-filter:blur(10px);font-size:13px;overflow:hidden}
 .panel.min{height:auto}
 .panel.min .log,.panel.min .tools,.panel.min form{display:none}
+.vc{display:flex;align-items:center;gap:6px;padding:6px 12px;border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}
+.vc[hidden]{display:none}
+.vc .who{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vc button,.tools button.voice{all:unset;cursor:pointer;padding:3px 8px;border-radius:6px;background:rgba(255,255,255,.08);color:var(--fg)}
+.tools button.voice.on{background:#3ddc84;color:#111}
+.vc button.muted{background:#ff4d4f;color:#fff}
 .hd{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);cursor:move;user-select:none}
 .dot{width:8px;height:8px;border-radius:50%;background:#888;flex:none}
 .dot.connected{background:#3ddc84}.dot.waiting,.dot.connecting,.dot.reconnecting{background:#f5b301}.dot.error{background:#ff4d4f}
@@ -224,8 +230,10 @@ form button{all:unset;cursor:pointer;background:var(--acc);color:#fff;border-rad
 </style>
 <div class="panel">
   <div class="hd"><span class="dot"></span><span class="title">一起看</span><span class="sub"></span><button class="minbtn" title="收起">–</button></div>
+  <div class="vc" hidden><span class="who"></span><button class="mute">🎙 静音</button></div>
   <div class="log"></div>
   <div class="tools">
+    <button class="voice" title="开启语音通话（P2P 直连，建议戴耳机）">🎙 语音</button>
     <button class="pull" title="把我当前的进度/播放状态推给所有人">⇆ 让大家同步到我</button>
     <label><input type="checkbox" class="follow">跟随切换视频</label>
     <label><input type="checkbox" class="danmaku">弹幕</label>
@@ -265,6 +273,8 @@ form button{all:unset;cursor:pointer;background:var(--acc);color:#fff;border-rad
       send(snapshot('pull'));
       api.line({ system: true, text: '已把你的进度推送给大家' });
     });
+    $('.voice').addEventListener('click', () => rt({ cmd: 'voice', on: !state.voice }));
+    $('.mute').addEventListener('click', () => rt({ cmd: 'mute', muted: !state.muted }));
     $('.follow').addEventListener('change', (e) => rt({ cmd: 'setPref', follow: e.target.checked }));
     $('.danmaku').addEventListener('change', (e) => rt({ cmd: 'setPref', danmaku: e.target.checked }));
     $('form').addEventListener('submit', (e) => {
@@ -300,6 +310,14 @@ form button{all:unset;cursor:pointer;background:var(--acc);color:#fff;border-rad
         $('.sub').title = (s.members || []).join('、');
         $('.follow').checked = !!s.follow;
         $('.danmaku').checked = !!s.danmaku;
+        const talkers = s.talkers || [];
+        $('.voice').classList.toggle('on', !!s.voice);
+        $('.voice').textContent = s.voice ? '📴 退出语音' : '🎙 语音';
+        $('.vc').hidden = !s.voice && !talkers.length;
+        $('.who').textContent = talkers.length ? '🔊 ' + talkers.join('、') + (s.voice ? '' : '（你只在听）') : (s.voice ? '语音已开启，等待朋友…' : '');
+        $('.mute').hidden = !s.voice;
+        $('.mute').classList.toggle('muted', !!s.muted);
+        $('.mute').textContent = s.muted ? '🔇 已静音' : '🎙 静音';
       },
       line(c) {
         const d = document.createElement('div');

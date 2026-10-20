@@ -9,6 +9,7 @@ const ADJ = ['快乐', '摸鱼', '熬夜', '干饭', '躺平', '追剧', '刷屏
 const NOUN = ['小猫', '柴犬', '水豚', '企鹅', '熊猫', '海獭', '仓鼠', '狐狸'];
 
 let activeTab = null;
+let voiceState = {};
 
 async function init() {
   [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -36,6 +37,15 @@ function render(s) {
   $('dot').className = 'dot ' + s.status;
   $('statusText').textContent = STATUS[s.status] || s.status;
   $('members').textContent = s.members && s.members.length ? '在线：' + s.members.join('、') : '';
+  $('voice').textContent = s.voice ? '📴 退出语音' : '🎙 开启语音';
+  $('voice').classList.toggle('on', !!s.voice);
+  $('voice').disabled = s.status !== 'connected';
+  $('voice').title = s.status === 'connected' ? '' : '朋友加入后才能语音';
+  $('mute').hidden = !s.voice;
+  $('mute').textContent = s.muted ? '取消静音' : '静音';
+  $('mute').classList.toggle('muted', !!s.muted);
+  $('talkers').textContent = s.talkers && s.talkers.length ? '🔊 正在听到：' + s.talkers.join('、') : '';
+  voiceState = s;
   const here = activeTab && s.boundTabId === activeTab.id;
   $('bind').hidden = here;
   $('boundHint').textContent = here ? '✓ 当前标签页正在同步' : (s.boundTabId != null ? '正在同步另一个标签页' : '还没有选择同步的标签页');
@@ -52,6 +62,8 @@ $('join').onclick = async () => {
   render(await bg('join', { code, name: myName(), tabId: activeTab?.id }));
 };
 $('code').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('join').click(); });
+$('voice').onclick = async () => render(await bg('voice', { on: !voiceState.voice }));
+$('mute').onclick = async () => { await bg('mute', { muted: !voiceState.muted }); render(await bg('getState')); };
 $('leave').onclick = async () => render(await bg('leave'));
 $('bind').onclick = async () => render(await bg('bind', { tabId: activeTab.id }));
 $('copy').onclick = async () => {

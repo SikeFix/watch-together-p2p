@@ -13,6 +13,9 @@ const DEFAULT_STATE = {
   chat: [],            // 最近 100 条聊天
   lastNavKey: null,    // 房间内最近一次“当前视频”
   lastLocalKey: null,  // 本端最近一次上报的视频
+  voice: false,        // 我是否开启了语音
+  muted: false,
+  talkers: [],         // 正在听到声音的成员
 };
 
 // ---------- 状态（storage.session，SW 休眠重启后仍在） ----------
@@ -42,8 +45,8 @@ async function ensureOffscreen() {
   if (!creating) {
     creating = chrome.offscreen.createDocument({
       url: 'offscreen.html',
-      reasons: ['WEB_RTC'],
-      justification: 'Keep the peer-to-peer watch-together connection alive across page navigations',
+      reasons: ['WEB_RTC', 'USER_MEDIA'],
+      justification: 'Keep the peer-to-peer watch-together connection and voice chat alive across page navigations',
     }).finally(() => { creating = null; });
   }
   await creating;
@@ -163,15 +166,38 @@ const handlers = {
 
   // offscreen
   async status(m) {
-    const prev = await getState();
     await update((s) => ({
       ...s,
       status: m.status,
       error: m.error || null,
       room: m.room ?? s.room,
       members: m.members ?? s.members,
+      voice: !!m.voice,
+      muted: !!m.muted,
+      talkers: m.talkers || [],
     }));
-    if (prev.status !== m.status || JSON.stringify(prev.members) !== JSON.stringify(m.members)) await broadcastState();
+    await broadcastState();
+  },
+
+  // 语音（popup / 内容脚本 / 授权页都可以调用）
+  async voice({ on }) {
+    const s = await getState();
+    if (s.room == null) return publicState(s);
+    await toOffscreen({ cmd: on ? 'voiceOn' : 'voiceOff' });
+    return publicState(s);
+  },
+
+  async mute({ muted }) {
+    await toOffscreen({ cmd: 'mute', muted: !!muted });
+  },
+
+  // offscreen 页面不能弹出麦克风授权框，打开一个扩展页面让用户授权一次
+  async voiceError({ name }) {
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      await chrome.tabs.create({ url: chrome.runtime.getURL('permission.html') });
+    } else {
+      await handlers.system({ text: name === 'NotFoundError' ? '没有找到麦克风' : '无法打开麦克风：' + name });
+    }
   },
 
   async peer({ msg }) {
