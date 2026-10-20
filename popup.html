@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>一起看 P2P</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/48.png" alt="">
+    <div>
+      <h1>一起看 P2P</h1>
+      <p>端到端直连 · 同步播放 · 边看边聊</p>
+    </div>
+  </header>
+
+  <section id="lobby">
+    <label>昵称<input id="name" maxlength="20" placeholder="你的昵称"></label>
+    <button id="create" class="primary">创建房间</button>
+    <div class="or"><span>或加入朋友的房间</span></div>
+    <div class="row">
+      <input id="code" maxlength="6" placeholder="6 位房间码" autocomplete="off">
+      <button id="join">加入</button>
+    </div>
+  </section>
+
+  <section id="room" hidden>
+    <div class="code-box">
+      <small>房间码（发给朋友）</small>
+      <div class="code-row"><b id="roomCode">------</b><button id="copy">复制</button></div>
+    </div>
+    <div class="status"><span id="dot" class="dot"></span><span id="statusText"></span></div>
+    <div id="members" class="members"></div>
+    <button id="bind">在当前标签页同步</button>
+    <p id="boundHint" class="hint"></p>
+    <button id="leave" class="danger">离开房间</button>
+  </section>
+
+  <p id="err" class="err" hidden></p>
+  <footer>两人分别打开同一个视频页（或让一方带着切换），播放 / 暂停 / 拖进度会自动同步。</footer>
+  <script src="popup.js"></script>
+</body>
+</html>

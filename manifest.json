@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "一起看 P2P · Watch Together",
+  "version": "0.1.0",
+  "description": "端到端（WebRTC P2P）一起看视频：同步播放/暂停/进度，跟随切换视频，边看边聊，弹幕显示。支持 B站、抖音、YouTube 及任意 <video> 网页。",
+  "minimum_chrome_version": "116",
+  "permissions": ["offscreen", "storage", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" }
+  },
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "content_scripts": [
+    { "matches": ["<all_urls>"], "js": ["content.js"], "run_at": "document_start" }
+  ]
+}
